@@ -118,6 +118,54 @@ def validate_kitti(model, iters=32, mixed_prec=False):
     print(f"Validation KITTI: EPE {epe}, D1 {d1}, {format(1/avg_runtime, '.2f')}-FPS ({format(avg_runtime, '.3f')}s)")
     return {'kitti-epe': epe, 'kitti-d1': d1}
 
+@torch.no_grad()
+def validate_sceneflowAgg(model, iters=32, mixed_prec=False):
+    """ Peform validation using the Scene Flow (TEST) split """
+    model.eval()
+    val_dataset = datasets.SceneFlowDatasets(dstype='frames_finalpass', things_test=True)
+
+    out_list, epe_list = [], []
+    for val_id in tqdm(range(len(val_dataset))):
+        _, image1, image2, flow_gt, valid_gt, _ = val_dataset[val_id]
+
+        image1 = image1[None].cuda()
+        image2 = image2[None].cuda()
+
+        padder = InputPadder(image1.shape, divis_by=32)
+        image1, image2 = padder.pad(image1, image2)
+
+        with autocast(enabled=mixed_prec):
+            flow_pr = model(image1, image2, iters=iters, test_mode=True)
+        flow_pr = padder.unpad(flow_pr).cpu().squeeze(0)
+        assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
+
+        # epe = torch.sum((flow_pr - flow_gt)**2, dim=0).sqrt()
+        epe = torch.abs(flow_pr - flow_gt)
+
+        epe = epe.flatten()
+        val = (valid_gt.flatten() >= 0.5) & (flow_gt.abs().flatten() < 192)
+
+        if(np.isnan(epe[val].mean().item())):
+            continue
+
+        out = (epe > 3.0)
+        epe_list.append(epe[val].mean().item())
+        out_list.append(out[val].cpu().numpy())
+        # if val_id == 400:
+        #     break
+
+    epe_list = np.array(epe_list)
+    out_list = np.concatenate(out_list)
+
+    epe = np.mean(epe_list)
+    d1 = 100 * np.mean(out_list)
+
+    f = open('test.txt', 'a')
+    f.write("Validation Scene Flow: %f, %f\n" % (epe, d1))
+
+    print("Validation Scene Flow: %f, %f" % (epe, d1))
+    return {'scene-disp-epe': epe, 'scene-disp-d1': d1}
+
 
 @torch.no_grad()
 def validate_sceneflow(model, iters=32, mixed_prec=False):

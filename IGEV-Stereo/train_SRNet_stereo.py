@@ -5,11 +5,13 @@ import logging
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from torch.autograd import Variable as V
+from torch.autograd import Variable
 from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from core.igev_stereo import IGEVStereo
+from core.igev_stereo import IGEVStereo_agg 
 from evaluate_stereo import *
 import core.stereo_datasets as datasets
 import torch.nn.functional as F
@@ -27,6 +29,80 @@ except:
             optimizer.step()
         def update(self):
             pass
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=0, alpha=None, size_average=True):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        if isinstance(alpha,(float,int)): self.alpha = torch.Tensor([alpha,1-alpha])
+        if isinstance(alpha,list): self.alpha = torch.Tensor(alpha)
+        self.size_average = size_average
+
+    def forward(self, target, input2):
+        # target1 = torch.squeeze(target, dim=1)
+        # target1 = torch.from_numpy(target)
+        # target1 = torch.unsqueeze(target, dim=1)
+        target1 = target
+        # print('target1.size', target1.size())
+        if input2.dim()>2:
+            input2 = input2.view(input2.size(0), input2.size(1),-1)  # N,C,H,W => N,C,H*W
+            input2 = input2.transpose(1,2)    # N,C,H*W => N,H*W,C
+            input2 = input2.contiguous().view(-1,input2.size(2))   # N,H*W,C => N*H*W,C
+        target2 = target1.view(-1,1).long()
+
+        logpt = F.log_softmax(input2, dim=1)
+        # print(logpt.size())
+        # print(target2.size())
+        logpt = logpt.gather(1,target2)
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        if self.alpha is not None:
+            if self.alpha.type()!=input2.data.type():
+                self.alpha = self.alpha.type_as(input2.data)
+            at = self.alpha.gather(0,target.data.view(-1).type(torch.int64))
+            logpt = logpt * Variable(at)
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        if self.size_average: return loss.mean()
+        else: return loss.sum()
+
+def sequence_loss_aux(disp_preds, disp_init_pred, disp_gt, aux_gt, aux_pred, valid, loss_gamma=0.9, max_disp=192):
+    """ Loss function defined over sequence of disp predictions """
+
+    aux_loss = FocalLoss(gamma=2, alpha=0.25)
+    focal_loss = aux_loss(aux_gt/256., aux_pred)
+
+    n_predictions = len(disp_preds)
+    assert n_predictions >= 1
+    disp_loss = 0.0
+    mag = torch.sum(disp_gt**2, dim=1).sqrt()
+    valid = ((valid >= 0.5) & (mag < max_disp)).unsqueeze(1)
+    assert valid.shape == disp_gt.shape, [valid.shape, disp_gt.shape]
+    assert not torch.isinf(disp_gt[valid.bool()]).any()
+
+
+    disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], size_average=True)
+    for i in range(n_predictions):
+        adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
+        i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
+        i_loss = (disp_preds[i] - disp_gt).abs()
+        assert i_loss.shape == valid.shape, [i_loss.shape, valid.shape, disp_gt.shape, disp_preds[i].shape]
+        disp_loss += i_weight * i_loss[valid.bool()].mean()
+    
+    disp_loss += focal_loss
+
+    epe = torch.sum((disp_preds[-1] - disp_gt)**2, dim=1).sqrt()
+    epe = epe.view(-1)[valid.view(-1)]
+
+    metrics = {
+        'epe': epe.mean().item(),
+        '1px': (epe < 1).float().mean().item(),
+        '3px': (epe < 3).float().mean().item(),
+        '5px': (epe < 5).float().mean().item(),
+    }
+    return disp_loss, metrics
 
 
 def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, max_disp=192):
@@ -118,7 +194,7 @@ class Logger:
 
 def train(args):
 
-    model = nn.DataParallel(IGEVStereo(args))
+    model = nn.DataParallel(IGEVStereo_agg(args))
     print("Parameter Count: %d" % count_parameters(model))
 
     train_loader = datasets.fetch_dataloader(args)
@@ -130,7 +206,7 @@ def train(args):
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        model.load_state_dict(checkpoint, strict=False)
         logging.info(f"Done loading checkpoint")
     model.cuda()
     model.train()
@@ -146,13 +222,14 @@ def train(args):
 
         for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
             optimizer.zero_grad()
-            image1, image2, disp_gt, valid = [x.cuda() for x in data_blob]
+            image1, image2, disp_gt, valid, aug_gt = [x.cuda() for x in data_blob]
 
             assert model.training
-            disp_init_pred, disp_preds = model(image1, image2, iters=args.train_iters)
+            disp_init_pred, disp_preds, aug_ests = model(image1, image2, iters=args.train_iters)
             assert model.training
 
-            loss, metrics = sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, max_disp=args.max_disp)
+            # loss, metrics = sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, max_disp=args.max_disp)
+            loss, metrics = sequence_loss_aux(disp_preds, disp_init_pred, disp_gt, aug_gt, aug_ests, valid, max_disp=args.max_disp)
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
@@ -170,7 +247,7 @@ def train(args):
                 logging.info(f"Saving file {save_path.absolute()}")
                 torch.save(model.state_dict(), save_path)
                 if 'sceneflow' in args.train_datasets:
-                    results = validate_sceneflow(model.module, iters=args.valid_iters)
+                    results = validate_sceneflowAgg(model.module, iters=args.valid_iters)
                 elif 'kitti' in args.train_datasets:
                     results = validate_kitti(model.module, iters=args.valid_iters)
                 else: 
@@ -196,16 +273,16 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='igev-stereo', help="name your experiment")
-    parser.add_argument('--restore_ckpt', default=None, help="load the weights from a specific checkpoint")
+    parser.add_argument('--restore_ckpt', default='./checkpoints/sceneflow.pth', help="load the weights from a specific checkpoint")
     parser.add_argument('--mixed_precision', default=True, action='store_true', help='use mixed precision')
     parser.add_argument('--precision_dtype', default='float16', choices=['float16', 'bfloat16', 'float32'], help='Choose precision type: float16 or bfloat16 or float32')
     parser.add_argument('--logdir', default='./checkpoints/sceneflow', help='the directory to save logs and checkpoints')
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
-    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
-    parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=200000, help="length of training schedule.")
+    parser.add_argument('--train_datasets', nargs='+', default=['sceneflowAgg'], help="training datasets.")
+    parser.add_argument('--lr', type=float, default=0.00005, help="max learning rate.")
+    parser.add_argument('--num_steps', type=int, default=80000, help="length of training schedule.")
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")

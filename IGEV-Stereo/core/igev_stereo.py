@@ -5,6 +5,7 @@ from core.update import BasicMultiUpdateBlock
 from core.extractor import MultiBasicEncoder, Feature
 from core.geometry import Combined_Geo_Encoding_Volume
 from core.submodule import *
+from core.net_util import AGGGate, nonlinearity
 import time
 
 
@@ -215,3 +216,192 @@ class IGEVStereo(nn.Module):
 
         init_disp = context_upsample(init_disp*4., spx_pred.float()).unsqueeze(1)
         return init_disp, disp_preds
+    
+
+class IGEVStereo_agg(nn.Module):
+    def __init__(self, args):
+        print("Using IGEVStereo_agg for training")
+        super().__init__()
+        self.args = args
+
+        context_dims = args.hidden_dims
+
+        self.cnet = MultiBasicEncoder(output_dim=[args.hidden_dims, context_dims], norm_fn="batch",
+                                      downsample=args.n_downsample)
+        self.update_block = BasicMultiUpdateBlock(self.args, hidden_dims=args.hidden_dims)
+
+        self.context_zqr_convs = nn.ModuleList(
+            [nn.Conv2d(context_dims[i], args.hidden_dims[i] * 3, 3, padding=3 // 2) for i in
+             range(self.args.n_gru_layers)])
+
+        self.feature = Feature()
+
+        self.stem_2 = nn.Sequential(
+            BasicConv_IN(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(32, 32, 3, 1, 1, bias=False),
+            nn.InstanceNorm2d(32), nn.ReLU()
+        )
+        self.stem_4 = nn.Sequential(
+            BasicConv_IN(32, 48, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(48, 48, 3, 1, 1, bias=False),
+            nn.InstanceNorm2d(48), nn.ReLU()
+        )
+
+        self.spx = nn.Sequential(nn.ConvTranspose2d(2 * 32, 9, kernel_size=4, stride=2, padding=1), )
+        self.spx_2 = Conv2x_IN(24, 32, True)
+        self.spx_4 = nn.Sequential(
+            BasicConv_IN(96, 24, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(24, 24, 3, 1, 1, bias=False),
+            nn.InstanceNorm2d(24), nn.ReLU()
+        )
+
+        self.spx_2_gru = Conv2x(32, 32, True)
+        self.spx_gru = nn.Sequential(nn.ConvTranspose2d(2 * 32, 9, kernel_size=4, stride=2, padding=1), )
+
+        self.conv = BasicConv_IN(96, 96, kernel_size=3, padding=1, stride=1)
+        self.desc = nn.Conv2d(96, 96, kernel_size=1, padding=0, stride=1)
+
+        self.corr_stem = BasicConv(8, 8, is_3d=True, kernel_size=3, stride=1, padding=1)
+        self.corr_feature_att = FeatureAtt(8, 96)
+        self.cost_agg = hourglass(8)
+        self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
+
+
+        self.decoder1 = DecoderBlock(96, 48)
+
+        self.finaldeconv1 = nn.ConvTranspose2d(48, 32, 4, 2, 1)
+        self.finalrelu1 = nonlinearity
+        self.finalconv2 = nn.Conv2d(32, 32, 3, padding=1)
+        self.finalrelu2 = nonlinearity
+        self.finalconv3 = nn.Conv2d(32, 2, 3, padding=1)
+        self.aggregation = AGGGate(rgb_in_planes=48, disp_in_planes=1, bn_momentum=0.1)
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def upsample_disp(self, disp, mask_feat_4, stem_2x):
+        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+            xspx = self.spx_2_gru(mask_feat_4, stem_2x)
+            spx_pred = self.spx_gru(xspx)
+            spx_pred = F.softmax(spx_pred, 1)
+            up_disp = context_upsample(disp * 4., spx_pred).unsqueeze(1)
+        return up_disp
+
+    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False):
+        """ Estimate disparity between pair of frames """
+        
+        image1 = (2 * (image1 / 255.0) - 1.0).contiguous()
+        image2 = (2 * (image2 / 255.0) - 1.0).contiguous()
+
+        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+            features_left = self.feature(image1)
+            aux_init_feature = features_left[0]
+            features_right = self.feature(image2)
+            stem_2x = self.stem_2(image1)
+            stem_4x = self.stem_4(stem_2x)
+            stem_2y = self.stem_2(image2)
+            stem_4y = self.stem_4(stem_2y)
+            features_left[0] = torch.cat((features_left[0], stem_4x), 1)
+            features_right[0] = torch.cat((features_right[0], stem_4y), 1)
+
+            match_left = self.desc(self.conv(features_left[0]))
+            match_right = self.desc(self.conv(features_right[0]))
+            gwc_volume = build_gwc_volume(match_left, match_right, self.args.max_disp//4, 8)
+            gwc_volume = self.corr_stem(gwc_volume)
+            gwc_volume = self.corr_feature_att(gwc_volume, features_left[0])
+            geo_encoding_volume = self.cost_agg(gwc_volume, features_left)
+
+            # Init disp from geometry encoding volume
+            prob = F.softmax(self.classifier(geo_encoding_volume).squeeze(1), dim=1)
+            init_disp = disparity_regression(prob, self.args.max_disp//4)
+            
+            del prob, gwc_volume
+
+            if not test_mode:
+                xspx = self.spx_4(features_left[0])
+                xspx = self.spx_2(xspx, stem_2x)
+                spx_pred = self.spx(xspx)
+                spx_pred = F.softmax(spx_pred, 1)
+
+            cnet_list = self.cnet(image1, num_layers=self.args.n_gru_layers)
+            net_list = [torch.tanh(x[0]) for x in cnet_list]
+            inp_list = [torch.relu(x[1]) for x in cnet_list]
+            inp_list = [list(conv(i).split(split_size=conv.out_channels//3, dim=1)) for i,conv in zip(inp_list, self.context_zqr_convs)]
+
+        geo_block = Combined_Geo_Encoding_Volume
+        geo_fn = geo_block(match_left.float(), match_right.float(), geo_encoding_volume.float(),
+                           radius=self.args.corr_radius, num_levels=self.args.corr_levels)
+        b, c, h, w = match_left.shape
+        coords = torch.arange(w).float().to(match_left.device).reshape(1, 1, w, 1).repeat(b, h, 1, 1)
+        disp = init_disp
+        disp_preds = []
+
+        # GRUs iterations to update disparity
+        for itr in range(iters):
+            disp = disp.detach()
+            geo_feat = geo_fn(disp, coords)
+            with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+                net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, iter16=self.args.n_gru_layers==3, iter08=self.args.n_gru_layers>=2)
+
+            disp = disp + delta_disp
+            if test_mode and itr < iters-1:
+                continue
+
+            # upsample predictions
+            disp_up = self.upsample_disp(disp, mask_feat_4, stem_2x)
+            disp_preds.append(disp_up)
+
+            # upsample predictions
+            disp_up = self.upsample_disp(disp, mask_feat_4, stem_2x)
+            disp_preds.append(disp_up)
+
+        if test_mode:
+            return disp_up
+
+        init_disp = context_upsample(init_disp * 4., spx_pred.float()).unsqueeze(1)
+        
+        with autocast(enabled=self.args.mixed_precision, dtype=getattr(torch, self.args.precision_dtype, torch.float16)):
+            dt = [aux_init_feature, disp]
+            dt = self.aggregation(dt)
+            d1 = self.decoder1(dt[1])
+            out = self.finaldeconv1(d1)
+            out = self.finalrelu1(out)
+            out = self.finalconv2(out)
+            out = self.finalrelu2(out)
+            out = self.finalconv3(out)
+            aug_out = out
+            # torch.Size([4, 2, 320, 736])
+            # print("aug out", aug_out.size())
+        return init_disp, disp_preds, aug_out
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, n_filters):
+        super(DecoderBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
+        self.norm1 = nn.BatchNorm2d(in_channels // 4)
+        self.relu1 = nonlinearity
+
+        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 3, stride=2, padding=1, output_padding=1)
+        self.norm2 = nn.BatchNorm2d(in_channels // 4)
+        self.relu2 = nonlinearity
+
+        self.conv3 = nn.Conv2d(in_channels // 4, n_filters, 1)
+        self.norm3 = nn.BatchNorm2d(n_filters)
+        self.relu3 = nonlinearity
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.relu1(x)
+        x = self.deconv2(x)
+        x = self.norm2(x)
+        x = self.relu2(x)
+        x = self.conv3(x)
+        x = self.norm3(x)
+        x = self.relu3(x)
+        return x
+

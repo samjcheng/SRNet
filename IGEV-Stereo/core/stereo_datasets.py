@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import copy
+import cv2
 import math
 import random
 from pathlib import Path
@@ -14,6 +15,115 @@ import os.path as osp
 
 from core.utils import frame_utils
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
+
+class StereoAggDataset(data.Dataset):
+    def __init__(self, aug_params=None, sparse=False, reader=None):
+        self.augmentor = None
+        self.sparse = sparse
+        self.img_pad = aug_params.pop("img_pad", None) if aug_params is not None else None
+        if aug_params is not None and "crop_size" in aug_params:
+            if sparse:
+                self.augmentor = SparseFlowAugmentor(**aug_params)
+            else:
+                self.augmentor = FlowAugmentor(**aug_params)
+
+        if reader is None:
+            self.disparity_reader = frame_utils.read_gen
+        else:
+            self.disparity_reader = reader        
+
+        self.is_test = False
+        self.init_seed = False
+        self.flow_list = []
+        self.disparity_list = []
+        self.image_list = []
+        self.extra_info = []
+
+    def __getitem__(self, index):
+
+        if self.is_test:
+            img1 = frame_utils.read_gen(self.image_list[index][0])
+            img2 = frame_utils.read_gen(self.image_list[index][1])
+            img1 = np.array(img1).astype(np.uint8)[..., :3]
+            img2 = np.array(img2).astype(np.uint8)[..., :3]
+            img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
+            img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
+            return img1, img2, self.extra_info[index]
+
+        if not self.init_seed:
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                torch.manual_seed(worker_info.id)
+                np.random.seed(worker_info.id)
+                random.seed(worker_info.id)
+                self.init_seed = True
+
+        index = index % len(self.image_list)
+        disp = self.disparity_reader(self.disparity_list[index])
+        
+        if isinstance(disp, tuple):
+            disp, valid = disp
+        else:
+            valid = disp < 512
+
+        img1 = frame_utils.read_gen(self.image_list[index][0])
+        img2 = frame_utils.read_gen(self.image_list[index][1])
+
+        img1 = np.array(img1).astype(np.uint8)
+        img2 = np.array(img2).astype(np.uint8)
+
+        disp = np.array(disp).astype(np.float32)
+
+        flow = np.stack([disp, np.zeros_like(disp)], axis=-1)
+
+        # grayscale images
+        if len(img1.shape) == 2:
+            img1 = np.tile(img1[...,None], (1, 1, 3))
+            img2 = np.tile(img2[...,None], (1, 1, 3))
+        else:
+            img1 = img1[..., :3]
+            img2 = img2[..., :3]
+
+        if self.augmentor is not None:
+            if self.sparse:
+                img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
+            else:
+
+                img1, img2, flow = self.augmentor(img1, img2, flow)
+                sift_aux, sift_aux_gauss = extract_Sift_feature(img1)
+                # print("size", np.shape(sift_aux_gauss))
+
+        img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
+        sift_aux_gauss = torch.from_numpy(np.expand_dims(sift_aux_gauss, 0)).float()
+        img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
+        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
+        
+
+        if self.sparse:
+            valid = torch.from_numpy(valid)
+        else:
+            valid = (flow[0].abs() < 512) & (flow[1].abs() < 512)
+
+        if self.img_pad is not None:
+
+            padH, padW = self.img_pad
+            img1 = F.pad(img1, [padW]*2 + [padH]*2)
+            img2 = F.pad(img2, [padW]*2 + [padH]*2)
+
+        flow = flow[:1]
+        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float(), sift_aux_gauss
+
+
+    def __mul__(self, v):
+        copy_of_self = copy.deepcopy(self)
+        copy_of_self.flow_list = v * copy_of_self.flow_list
+        copy_of_self.image_list = v * copy_of_self.image_list
+        copy_of_self.disparity_list = v * copy_of_self.disparity_list
+        copy_of_self.extra_info = v * copy_of_self.extra_info
+        return copy_of_self
+        
+    def __len__(self):
+        return len(self.image_list)
 
 
 class StereoDataset(data.Dataset):
@@ -121,9 +231,73 @@ class StereoDataset(data.Dataset):
     def __len__(self):
         return len(self.image_list)
 
+class SceneFlowAggDatasets(StereoAggDataset):
+    def __init__(self, aug_params=None, root='/DATA/i2r/guzw/dataset/sttr/sceneflow/', dstype='frames_finalpass', things_test=False):
+        super(SceneFlowAggDatasets, self).__init__(aug_params)
+        self.root = root
+        self.dstype = dstype
+
+        if things_test:
+            self._add_things("TEST")
+        else:
+            self._add_things("TRAIN")
+            self._add_monkaa("TRAIN")
+            self._add_driving("TRAIN")
+
+    def _add_things(self, split='TRAIN'):
+        """ Add FlyingThings3D data """
+
+        original_length = len(self.disparity_list)
+        # root = osp.join(self.root, 'FlyingThings3D')
+        root = self.root
+        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/*/left/*.png')) )
+        right_images = [ im.replace('left', 'right') for im in left_images ]
+        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+
+        state = np.random.get_state()
+        np.random.seed(1000)
+        # val_idxs = set(np.random.permutation(len(left_images))[:100])
+        val_idxs = set(np.random.permutation(len(left_images)))
+        np.random.set_state(state)
+
+        for idx, (img1, img2, disp) in enumerate(zip(left_images, right_images, disparity_images)):
+            if (split == 'TEST' and idx in val_idxs) or split == 'TRAIN':
+                self.image_list += [ [img1, img2] ]
+                self.disparity_list += [ disp ]
+        logging.info(f"Added {len(self.disparity_list) - original_length} from FlyingThings {self.dstype}")
+
+    def _add_monkaa(self, split="TRAIN"):
+        """ Add FlyingThings3D data """
+
+        original_length = len(self.disparity_list)
+        root = self.root
+        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/left/*.png')) )
+        right_images = [ image_file.replace('left', 'right') for image_file in left_images ]
+        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+
+        for img1, img2, disp in zip(left_images, right_images, disparity_images):
+            self.image_list += [ [img1, img2] ]
+            self.disparity_list += [ disp ]
+        logging.info(f"Added {len(self.disparity_list) - original_length} from Monkaa {self.dstype}")
+
+
+    def _add_driving(self, split="TRAIN"):
+        """ Add FlyingThings3D data """
+
+        original_length = len(self.disparity_list)
+        root = self.root
+        left_images = sorted( glob(osp.join(root, self.dstype, split, '*/*/*/left/*.png')) )
+        right_images = [ image_file.replace('left', 'right') for image_file in left_images ]
+        disparity_images = [ im.replace(self.dstype, 'disparity').replace('.png', '.pfm') for im in left_images ]
+
+        for img1, img2, disp in zip(left_images, right_images, disparity_images):
+            self.image_list += [ [img1, img2] ]
+            self.disparity_list += [ disp ]
+        logging.info(f"Added {len(self.disparity_list) - original_length} from Driving {self.dstype}")
+
 
 class SceneFlowDatasets(StereoDataset):
-    def __init__(self, aug_params=None, root='/data/sceneflow/', dstype='frames_finalpass', things_test=False):
+    def __init__(self, aug_params=None, root='/DATA/i2r/guzw/dataset/sttr/sceneflow/', dstype='frames_finalpass', things_test=False):
         super(SceneFlowDatasets, self).__init__(aug_params)
         self.root = root
         self.dstype = dstype
@@ -308,6 +482,12 @@ def fetch_dataloader(args):
             #new_dataset = (clean_dataset*4) + (final_dataset*4)
             new_dataset = final_dataset
             logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
+        elif dataset_name == 'sceneflowAgg':
+            #clean_dataset = SceneFlowDatasets(aug_params, dstype='frames_cleanpass')
+            final_dataset = SceneFlowAggDatasets(aug_params, dstype='frames_finalpass')
+            #new_dataset = (clean_dataset*4) + (final_dataset*4)
+            new_dataset = final_dataset
+            logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
         elif 'kitti' in dataset_name:
             new_dataset = KITTI(aug_params)
             logging.info(f"Adding {len(new_dataset)} samples from KITTI")
@@ -327,4 +507,52 @@ def fetch_dataloader(args):
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader
+
+def gaussian2D(shape, sigma=1):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+
+    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
+    return h
+
+
+def draw_gaussian(heatmap, center_x, center_y, radius, k=1):
+    diameter = 2 * radius + 1
+    gaussian = gaussian2D((diameter, diameter), sigma=diameter / 6)
+
+    x = center_x
+    y = center_y
+
+    height, width = heatmap.shape[0:2]
+
+    left, right = min(x, radius), min(width - x, radius + 1)
+    top, bottom = min(y, radius), min(height - y, radius + 1)
+
+    masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
+    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
+    if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:  # TODO debug
+        np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
+    return heatmap
+
+
+def extract_Sift_feature(img, gaussian_radius= 5, show_case=False):
+    '''
+
+    :param image_path: input image
+    :param show_case: plt.imshow(img) or not
+    :return: sift keypoint binary mask and gaussian heatmap
+    '''
+
+    # img = cv2.imread(image_path)
+    sift = cv2.xfeatures2d.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(img, None)
+    # generate binary mask (0 for background, 1 for sift keypoint)
+    binary_mask = np.zeros(shape=(img.shape[0], img.shape[1]))
+    gaussian_mask = np.zeros(shape=(img.shape[0], img.shape[1]))
+    for k_p in kp1:
+        binary_mask[int(k_p.pt[1]), int(k_p.pt[0])] = 1
+        draw_gaussian(gaussian_mask, int(k_p.pt[0]), int(k_p.pt[1]), radius=gaussian_radius)
+
+    return binary_mask* 255. , gaussian_mask* 255.
 
