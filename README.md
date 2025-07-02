@@ -5,7 +5,7 @@ This repository contains the source code for our paper:
 
 SRNet: Self-supervised Structure Regularization for Stereo Matching
 
-<img src="IGEV-Stereo/IGEV-Stereo.png">
+<!-- <img src="IGEV-Stereo/IGEV-Stereo.png"> -->
 
 ## 📢 News
 2024-12-30: We add bfloat16 training to prevent potential NAN issues during the training process.<br>
@@ -106,6 +106,16 @@ By default `core/stereo_datasets.py` will search for the datasets in these locat
         ├── dtu_test
 ```
 You should replace the default path with your own.
+
+### DTU
+* Download pre-processed [DTU's training set](https://polybox.ethz.ch/index.php/s/ugDdJQIuZTk4S35) (provided by PatchmatchNet). The dataset is already organized as follows:
+```
+root_directory
+├──Cameras_1
+├──Rectified
+└──Depths_raw
+```
+* Download our processed camera parameters from [here](https://drive.google.com/file/d/1DAAFXV6bZx0NNWFQMwoSeWMt5mr64myD/view?usp=sharing). Unzip all the camera folders into `root_directory/Cameras_1`.
 
 ## Evaluation
 

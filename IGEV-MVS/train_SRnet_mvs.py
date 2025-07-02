@@ -8,12 +8,14 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from torch.autograd import Variable as V
+from torch.autograd import Variable
 import numpy as np
 import random
 import time
 from torch.utils.tensorboard import SummaryWriter
 from datasets import find_dataset_def
-from core.igev_mvs import IGEVMVS
+from core.igev_mvs_agg import IGEVMVSAGG
 from core.submodule import depth_normalization, depth_unnormalization
 from utils import *
 import sys
@@ -27,19 +29,19 @@ cudnn.benchmark = True
 parser = argparse.ArgumentParser(description='IterMVStereo for high-resolution multi-view stereo')
 parser.add_argument('--mode', default='train', help='train or val', choices=['train', 'val'])
 
-parser.add_argument('--dataset', default='dtu_yao', help='select dataset')
+parser.add_argument('--dataset', default='dtu_yao_agg', help='select dataset')
 parser.add_argument('--trainpath', default='/DATA/i2r/guzw/dataset/dtu/dtu/', help='train datapath')
 parser.add_argument('--valpath', help='/DATA/i2r/guzw/dataset/dtu/dtu')
 parser.add_argument('--trainlist', default='./lists/dtu/train.txt', help='train list')
 parser.add_argument('--vallist', default='./lists/dtu/val.txt', help='validation list')
 parser.add_argument('--maxdisp', default=256)
 
-parser.add_argument('--epochs', type=int, default=32, help='number of epochs to train')
-parser.add_argument('--lr', type=float, default=0.0002, help='learning rate')
+parser.add_argument('--epochs', type=int, default=10, help='number of epochs to train')
+parser.add_argument('--lr', type=float, default=0.00005, help='learning rate')
 parser.add_argument('--wd', type=float, default=.00001, help='weight decay')
 
 parser.add_argument('--batch_size', type=int, default=6, help='train batch size')
-parser.add_argument('--loadckpt', default=None, help='load a specific checkpoint')
+parser.add_argument('--loadckpt', default='/DATA/i2r/guzw/workspace/StereoMatching/IGEV_SR/IGEV-MVS/checkpoints/dtu.ckpt', help='load a specific checkpoint')
 parser.add_argument('--logdir', default='./checkpoints/', help='the directory to save checkpoints/logs')
 parser.add_argument('--resume', action='store_true', help='continue to train the model')
 parser.add_argument('--regress', action='store_true', help='train the regression and confidence')
@@ -88,6 +90,71 @@ def sequence_loss(disp_preds, disp_init_pred, depth_gt, mask, depth_min, depth_m
 
     return loss
 
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=0, alpha=None, size_average=True):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        if isinstance(alpha,(float,int)): self.alpha = torch.Tensor([alpha,1-alpha])
+        if isinstance(alpha,list): self.alpha = torch.Tensor(alpha)
+        self.size_average = size_average
+
+    def forward(self, target, input2):
+        # target1 = torch.squeeze(target, dim=1)
+        # target1 = torch.from_numpy(target)
+        # target1 = torch.unsqueeze(target, dim=1)
+        target1 = target
+        # print('target1.size', target1.size())
+        if input2.dim()>2:
+            input2 = input2.view(input2.size(0), input2.size(1),-1)  # N,C,H,W => N,C,H*W
+            input2 = input2.transpose(1,2)    # N,C,H*W => N,H*W,C
+            input2 = input2.contiguous().view(-1,input2.size(2))   # N,H*W,C => N*H*W,C
+        target2 = target1.view(-1,1).long()
+
+        logpt = F.log_softmax(input2, dim=1)
+        # print(logpt.size())
+        # print(target2.size())
+        logpt = logpt.gather(1,target2)
+        logpt = logpt.view(-1)
+        pt = Variable(logpt.data.exp())
+
+        if self.alpha is not None:
+            if self.alpha.type()!=input2.data.type():
+                self.alpha = self.alpha.type_as(input2.data)
+            at = self.alpha.gather(0,target.data.view(-1).type(torch.int64))
+            logpt = logpt * Variable(at)
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        if self.size_average: return loss.mean()
+        else: return loss.sum()
+
+def sequence_loss_aux(disp_preds, disp_init_pred, depth_gt,  aux_gt, aux_pred, mask, depth_min, depth_max, loss_gamma=0.9):
+    """ Loss function defined over sequence of depth predictions """
+    aux_loss = FocalLoss(gamma=2, alpha=0.25)
+    focal_loss = aux_loss(aux_gt/256., aux_pred)
+
+    cross_entropy = nn.BCEWithLogitsLoss()
+    n_predictions = len(disp_preds)
+    assert n_predictions >= 1
+    loss = 0.0
+    mask = mask > 0.5
+    batch, _, height, width = depth_gt.size()
+    inverse_depth_min = (1.0 / depth_min).view(batch, 1, 1, 1)
+    inverse_depth_max = (1.0 / depth_max).view(batch, 1, 1, 1)
+
+    normalized_disp_gt = depth_normalization(depth_gt, inverse_depth_min, inverse_depth_max)
+    loss += 1.0 * F.l1_loss(disp_init_pred[mask], normalized_disp_gt[mask], reduction='mean')
+
+    if args.iteration != 0:
+        for i in range(n_predictions):
+            adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
+            i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
+            loss += i_weight * F.l1_loss(disp_preds[i][mask], normalized_disp_gt[mask], reduction='mean')
+    loss += focal_loss
+    return loss
+
+
 # parse arguments and check
 args = parser.parse_args()
 if args.resume: # store_true means set the variable as "True"
@@ -124,11 +191,12 @@ TrainImgLoader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_wo
 TestImgLoader = DataLoader(test_dataset, args.batch_size, shuffle=False, num_workers=4, drop_last=False)
 
 # model, optimizer
-model = IGEVMVS(args)
+model = IGEVMVSAGG(args)
 if args.mode in ["train", "val"]:
     model = nn.DataParallel(model)
 model.cuda()
-model_loss = sequence_loss
+model_loss = sequence_loss_aux
+model_eval_loss = sequence_loss
 optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.wd, eps=1e-8)
 
 # load parameters
@@ -227,11 +295,16 @@ def train_sample(args, sample, detailed_summary=False, scaler=None):
     mask_0 = mask['level_0']
     depth_gt_1 = depth_gt['level_2']
     mask_1 = mask['level_2']
+    aux_gt = sample_cuda["aux_gt"]
+    # print("aux_gt size", aux_gt.size())
 
-    disp_init, disp_predictions = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+    disp_init, disp_predictions, aug_est = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"])
-
-    loss = model_loss(disp_predictions, disp_init, depth_gt_0, mask_0, sample_cuda["depth_min"], sample_cuda["depth_max"])
+    # print("aug_est size", aug_est.size())
+    # aux_gt size torch.Size([6, 1, 512, 640])
+    # aug_est size torch.Size([6, 2, 512, 640])
+    # loss = model_loss(disp_predictions, disp_init, depth_gt_0, mask_0, sample_cuda["depth_min"], sample_cuda["depth_max"])
+    loss = sequence_loss_aux(disp_predictions, disp_init, depth_gt_0, aux_gt, aug_est, mask_0, sample_cuda["depth_min"], sample_cuda["depth_max"])
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -264,10 +337,10 @@ def test_sample(args, sample, detailed_summary=True):
     depth_gt_1 = depth_gt['level_2']
     mask_1 = mask['level_2']
 
-    disp_init, disp_predictions = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
+    disp_init, disp_predictions, _ = model(sample_cuda["imgs"], sample_cuda["proj_matrices"],
                     sample_cuda["depth_min"], sample_cuda["depth_max"])
 
-    loss = model_loss(disp_predictions, disp_init, depth_gt_0, mask_0, sample_cuda["depth_min"], sample_cuda["depth_max"])
+    loss = model_eval_loss(disp_predictions, disp_init, depth_gt_0, mask_0, sample_cuda["depth_min"], sample_cuda["depth_max"])
 
 
     inverse_depth_min = (1.0 / sample_cuda["depth_min"]).view(sample_cuda["depth_min"].size()[0], 1, 1, 1)
