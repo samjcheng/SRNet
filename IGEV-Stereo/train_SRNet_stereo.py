@@ -279,10 +279,10 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', default='./checkpoints/sceneflow', help='the directory to save logs and checkpoints')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8, help="batch size used during training.")
+    parser.add_argument('--batch_size', type=int, default=16, help="batch size used during training.")
     parser.add_argument('--train_datasets', nargs='+', default=['sceneflowAgg'], help="training datasets.")
     parser.add_argument('--lr', type=float, default=0.00005, help="max learning rate.")
-    parser.add_argument('--num_steps', type=int, default=80000, help="length of training schedule.")
+    parser.add_argument('--num_steps', type=int, default=60000, help="length of training schedule.")
     parser.add_argument('--image_size', type=int, nargs='+', default=[320, 736], help="size of the random image crops used during training.")
     parser.add_argument('--train_iters', type=int, default=22, help="number of updates to the disparity field in each forward pass.")
     parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
