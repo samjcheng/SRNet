@@ -191,21 +191,6 @@ If you find our work useful in your research, please consider citing our paper:
 
 ```bibtex
 
-@inproceedings{xu2023iterative,
-  title={Iterative Geometry Encoding Volume for Stereo Matching},
-  author={Xu, Gangwei and Wang, Xianqi and Ding, Xiaohuan and Yang, Xin},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={21919--21928},
-  year={2023}
-}
-
-@article{xu2025igev++,
-  title={Igev++: Iterative multi-range geometry encoding volumes for stereo matching},
-  author={Xu, Gangwei and Wang, Xianqi and Zhang, Zhaoxing and Cheng, Junda and Liao, Chunyuan and Yang, Xin},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
-  year={2025},
-  publisher={IEEE}
-}
 
 ```
 
